@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""
+Check a lead against the machine-wide registry before adding or contacting it.
+
+    leadcheck example.com                # domain / URL
+    leadcheck jane@example.com           # email (also matches @domain rows)
+    leadcheck "Union Square Hospitality" # company name (fuzzy-ish)
+    leadcheck --batch results.csv        # annotate a whole CSV (VA results)
+    leadcheck --refresh                  # rebuild the registry from sources
+    leadcheck --sync [--dry-run]         # push touches into ai_outreach suppression
+    leadcheck --stats                    # row counts and freshness
+
+Exit codes: 0 = match found, 1 = clean (no match), 2 = error.
+Batch mode writes <file>-checked.csv with registry_status and
+registry_matches columns appended, and always exits 0 on success.
+"""
+
+import csv
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+DB_PATH = os.path.join(HERE, "registry.db")
+STALE_DAYS = 7
+
+STATUS_ORDER = ["replied", "meeting", "inbound_request", "contacted",
+                "ooo", "bounced", "suppressed", "queued",
+                "audited", "va_result", "lead"]
+
+STATUS_HINT = {
+    "replied": "they replied to outreach — do NOT cold-contact again",
+    "meeting": "a meeting was booked — do NOT cold-contact again",
+    "inbound_request": "they reached out first — handle as inbound, not outreach",
+    "contacted": "already contacted — do not re-send",
+    "ooo": "auto-replied out of office — already contacted, do not re-send",
+    "bounced": "mail bounced — already attempted, fix the address before retrying",
+    "suppressed": "on a suppression list — do not contact",
+    "queued": "queued for sending in an existing campaign",
+    "audited": "already through the site_audit pipeline",
+    "va_result": "already surfaced by a VA search",
+    "lead": "already on a lead list (not yet contacted)",
+}
+
+
+# A status the registry grows that isn't ranked above sorts last rather than
+# raising — a dedupe check must never crash on an unfamiliar status.
+def status_rank(status):
+    try:
+        return STATUS_ORDER.index(status)
+    except ValueError:
+        return len(STATUS_ORDER)
+
+
+def norm_domain(value):
+    if not value:
+        return None
+    v = value.strip().lower()
+    v = re.sub(r"^[a-z]+://", "", v)
+    v = v.split("/")[0].split("?")[0].split(":")[0]
+    if v.startswith("www."):
+        v = v[4:]
+    v = v.rstrip(".")
+    return v if "." in v else None
+
+
+def norm_company(value):
+    if not value:
+        return None
+    v = re.sub(r"[^\w\s]", " ", value.lower())
+    v = re.sub(r"\s+", " ", v).strip()
+    v = re.sub(r"\b(llc|inc|ltd|llp|pllc|pc|corp|co)\.?$", "", v).strip()
+    return v or None
+
+
+def open_db():
+    if not os.path.exists(DB_PATH):
+        sys.exit("registry.db missing — run: leadcheck --refresh")
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def check_freshness(conn):
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='built_at'").fetchone()
+    if not row:
+        return
+    built = datetime.strptime(row[0], "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - built).days
+    if age >= STALE_DAYS:
+        print(f"WARN: registry is {age} days old — run leadcheck --refresh",
+              file=sys.stderr)
+    failed = conn.execute(
+        "SELECT value FROM meta WHERE key='failed_sources'").fetchone()
+    if failed and failed[0]:
+        print(f"WARN: last build skipped sources: {failed[0]}",
+              file=sys.stderr)
+
+
+def find(conn, query):
+    """Return matching rows for a free-form query (email, domain, or name)."""
+    q = query.strip()
+    rows = []
+    if "@" in q:
+        email = q.lower().strip("<>")
+        rows = conn.execute(
+            "SELECT * FROM records WHERE email = ?", (email,)).fetchall()
+        # Same company, different address, still counts as a collision.
+        dom = norm_domain(email.split("@", 1)[1])
+        if dom:
+            rows += conn.execute(
+                "SELECT * FROM records WHERE domain = ? OR email LIKE ?",
+                (dom, f"%@{dom}")).fetchall()
+    else:
+        dom = norm_domain(q) if ("." in q and " " not in q) else None
+        if dom:
+            rows = conn.execute(
+                "SELECT * FROM records WHERE domain = ? OR email LIKE ?",
+                (dom, f"%@{dom}")).fetchall()
+        if not rows:
+            comp = norm_company(q)
+            if comp:
+                rows = conn.execute(
+                    "SELECT * FROM records WHERE company_norm = ?"
+                    " OR company_norm LIKE ?",
+                    (comp, f"%{comp}%")).fetchall()
+    seen, out = set(), []
+    for r in rows:
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            out.append(r)
+    return out
+
+
+def best_status(rows):
+    for status in STATUS_ORDER:
+        if any(r["status"] == status for r in rows):
+            return status
+    # unranked statuses only: still report the strongest thing we have
+    return rows[0]["status"] if rows else None
+
+
+def print_matches(query, rows):
+    if not rows:
+        print(f"CLEAN  {query} — not in any list, campaign, or pipeline")
+        return
+    status = best_status(rows)
+    hint = STATUS_HINT.get(status, "already known to the registry — check before contacting")
+    print(f"{status.upper()}  {query} — {hint}")
+    by_project = {}
+    for r in rows:
+        by_project.setdefault(r["project"], []).append(r)
+    for project in sorted(by_project):
+        for r in sorted(by_project[project],
+                        key=lambda r: status_rank(r["status"]))[:5]:
+            bits = [b for b in (
+                r["company"], r["contact_name"], r["email"],
+                r["instagram_username"] and f"ig:{r['instagram_username']}",
+                r["detail"], r["last_activity"]) if b]
+            print(f"  [{r['status']:>10}] {project}: {' | '.join(bits)}")
+            print(f"               source: {r['source_file']}")
+        extra = len(by_project[project]) - 5
+        if extra > 0:
+            print(f"               (+{extra} more rows in {project})")
+
+
+ROW_KEY_COLS = ("website url", "website", "url", "domain", "email",
+                "primary_email", "company website")
+ROW_NAME_COLS = ("company name", "company", "agency", "group", "name")
+
+
+def batch(conn, path):
+    with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows_in = list(reader)
+    if not rows_in:
+        sys.exit(f"{path}: no data rows")
+
+    lowmap = {c.strip().lower(): c for c in fieldnames}
+    key_col = next((lowmap[c] for c in ROW_KEY_COLS if c in lowmap), None)
+    name_col = next((lowmap[c] for c in ROW_NAME_COLS if c in lowmap), None)
+    if not key_col and not name_col:
+        sys.exit(f"{path}: no recognizable domain/url/email/company column "
+                 f"(have: {', '.join(fieldnames)})")
+
+    out_path = re.sub(r"\.csv$", "", path) + "-checked.csv"
+    hits = 0
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=fieldnames + ["registry_status", "registry_matches"])
+        writer.writeheader()
+        for row in rows_in:
+            query = (row.get(key_col) or "").strip() if key_col else ""
+            if not query and name_col:
+                query = (row.get(name_col) or "").strip()
+            matches = find(conn, query) if query else []
+            if matches:
+                hits += 1
+                status = best_status(matches)
+                projects = sorted({f"{m['project']}:{m['status']}"
+                                   for m in matches})
+                row["registry_status"] = status
+                row["registry_matches"] = "; ".join(projects)
+            else:
+                row["registry_status"] = "clean"
+                row["registry_matches"] = ""
+            writer.writerow(row)
+    print(f"{hits}/{len(rows_in)} rows matched the registry "
+          f"-> {out_path}")
+
+
+def stats(conn):
+    built = conn.execute(
+        "SELECT value FROM meta WHERE key='built_at'").fetchone()
+    print(f"built_at: {built[0] if built else 'unknown'}")
+    print(f"{'rows':>7}  project / status")
+    for project, status, n in conn.execute(
+            "SELECT project, status, count(*) FROM records"
+            " GROUP BY project, status ORDER BY project, status"):
+        print(f"{n:>7}  {project} / {status}")
+    total = conn.execute("SELECT count(*) FROM records").fetchone()[0]
+    print(f"{total:>7}  total")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0)
+    if args[0] == "--refresh":
+        result = subprocess.run(
+            [sys.executable, os.path.join(HERE, "ingest.py")] + args[1:])
+        sys.exit(result.returncode)
+    if args[0] == "--sync":
+        # Push cross-project touches into ai_outreach's suppression table.
+        result = subprocess.run(
+            [sys.executable, os.path.join(HERE, "sync_ai_outreach.py")]
+            + args[1:])
+        sys.exit(result.returncode)
+
+    conn = open_db()
+    try:
+        if args[0] == "--stats":
+            stats(conn)
+        elif args[0] == "--batch":
+            if len(args) < 2:
+                sys.exit("usage: leadcheck --batch file.csv")
+            check_freshness(conn)
+            batch(conn, args[1])
+        else:
+            check_freshness(conn)
+            query = " ".join(args)
+            rows = find(conn, query)
+            print_matches(query, rows)
+            sys.exit(0 if rows else 1)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

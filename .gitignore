@@ -1,0 +1,14 @@
+# The registry itself is a rebuilt read-model containing real contact data
+# for thousands of people and businesses. It is never committed.
+registry.db
+registry.db-journal
+registry.db-wal
+registry.db-shm
+
+# Local source data
+*.csv
+*-checked.csv
+
+__pycache__/
+*.pyc
+.DS_Store
